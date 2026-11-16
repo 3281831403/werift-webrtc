@@ -6,11 +6,11 @@
 
 - **The spec / browser value of the compatibility options is `"standard"`** (`certificateScope`, `mLineReuse`, `keyFrameRequestRouting`; also `transceiverPairing`): each option takes `"standard"` for the behavior the specifications and browsers have, and a value naming werift's own behavior. The old names of the spec / browser side and of `keyFrameRequestRouting`'s default are still accepted on input, so existing configurations keep their behavior, but `getConfiguration()` now returns the current name, the TypeScript types `MLineReuse` / `KeyFrameRequestRouting` / `CertificateScope` and `KeyFrameRequestRoutingModes` list the current names, and the `TypeError` message lists them. `SDPManager` (`mLineReuse`) and `RtpRouter.keyFrameRequestRouting`, set directly, accept only the current names. Defaults and behavior are unchanged.
 
-  | Option | Up to v0.27.0 | Now (default first) | Old names still accepted |
-  | --- | --- | --- | --- |
-  | `certificateScope` | `"process"` (default) / `"peerConnection"` | `"process"` / `"standard"` | `"peerConnection"` |
-  | `mLineReuse` | `"compatible"` (default) / `"aggressive"` | `"standard"` / `"aggressive"` | `"compatible"` |
-  | `keyFrameRequestRouting` | `"compatible"` (default) / `"strict"` | `"fallback"` / `"standard"` | `"compatible"`, `"strict"` |
+  | Option                   | Up to v0.27.0                              | Now (default first)           | Old names still accepted   |
+  | ------------------------ | ------------------------------------------ | ----------------------------- | -------------------------- |
+  | `certificateScope`       | `"process"` (default) / `"peerConnection"` | `"process"` / `"standard"`    | `"peerConnection"`         |
+  | `mLineReuse`             | `"compatible"` (default) / `"aggressive"`  | `"standard"` / `"aggressive"` | `"compatible"`             |
+  | `keyFrameRequestRouting` | `"compatible"` (default) / `"strict"`      | `"fallback"` / `"standard"`   | `"compatible"`, `"strict"` |
 
 ### 🚀 Features
 
@@ -30,6 +30,7 @@
 
 ### 🐛 Bug Fixes
 
+- **AV1 W=0 depacketization** (`werift-rtp`): `AV1RtpPayload.deSerialize` parses W=0 and W=1..3 packets through one length-driven element walk instead of a positional heuristic, so OBU element boundaries always come from the (LEB128) length fields. Only the first element can be a Z continuation and only the last a Y continuation; a complete OBU sharing a packet with a fragment is no longer merged into the fragment chain. Both branches now reject an element length that runs past the payload with an explicit `AV1 OBU element length exceeds payload` error instead of mis-parsing. Reassembly of W=0..3 with Z/Y cross-packet fragments stays byte-exact against the sender's OBU sequence (non-last OBUs keep/gain their size field so the reconstructed bitstream is self-delimiting).
 - **The codecs of a remote offer are resolved with the transceiver it is applied to** (#816): `setRemoteDescription(offer)` resolves codecs before its implicit rollback, replacement or unapplied-`createOffer` revert, and used to pair m-lines with the transceivers as they were before (a local transceiver whose MID only the rolled-back local offer gave could lend its codec preferences or track to an m-line another transceiver then took). Both now pair with the state after them.
 - **A replacement remote offer keeps the transceiver the replaced one created for a MID it describes again**, instead of dropping its MID and pairing it again by kind.
 
@@ -413,7 +414,7 @@ This release collects everything merged since v0.25.2, including the `rc/0.26.0`
 ### 🐛 Bug Fixes
 
 - **ICE consent freshness (RFC 7675)** (#649): Align consent-to-send monitoring with RFC 7675 so long-lived sessions against **ICE-lite** peers (e.g. OpenAI Realtime) no longer drop media after ~30s.
-  - **Cadence**: Schedule the next consent Binding from the previous *request start* time at 0.8–1.2× `CONSENT_INTERVAL` (5s base), not after response completion.
+  - **Cadence**: Schedule the next consent Binding from the previous _request start_ time at 0.8–1.2× `CONSENT_INTERVAL` (5s base), not after response completion.
   - **Expiry**: Independent 30s timer from the last valid consent response (`CONSENT_TIMEOUT`); a single request timeout no longer stops monitoring.
   - **Single-shot requests**: Consent transactions use `retransmissions: 0` with an RTT-based response wait (`consentResponseTimeoutMs`, min 500ms / default 1s) instead of a ~50ms RTO death.
   - **Authenticity**: Accept only responses from the selected-pair remote address, and require `MESSAGE-INTEGRITY` when an integrity key is set.
@@ -530,7 +531,7 @@ This release collects everything merged since v0.25.2, including the `rc/0.26.0`
 - **Transport**: Add `closed` property to transport classes and improve close methods
 - **Exports**: Export `stats` module from `media/index.ts`
 - **Performance/Refactor**:
-    - Remove `lodash` dependency (replaced with native functions or lighter alternatives)
+  - Remove `lodash` dependency (replaced with native functions or lighter alternatives)
     - Remove `nano-time`, `date-fns`, `uuid` dependencies
     - Use `structuredClone` instead of `lodash/cloneDeep`
     - Replace `lodash/isEqual` with `fast-deep-equal`

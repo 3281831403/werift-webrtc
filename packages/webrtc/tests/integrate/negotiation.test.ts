@@ -162,22 +162,48 @@ describe("codec negotiation", () => {
         await callee.createAnswer(),
       );
       await Promise.all([caller.close(), callee.close()]);
-      return answer;
+      return { offer, answer };
     };
 
+    const rtpmapNames = (sdp: { string: string }) =>
+      sdp.string
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("a=rtpmap"))
+        .map((line) => line.split(" ")[1]);
+
     it.each([
-      ["AV1 offer / AV1X answerer", useAV1(), useAV1X()],
-      ["AV1X offer / AV1 answerer", useAV1X(), useAV1()],
+      ["AV1 offer / AV1X answerer", useAV1(), useAV1X(), "video/AV1", "AV1/"],
+      ["AV1X offer / AV1 answerer", useAV1X(), useAV1(), "video/AV1X", "AV1X/"],
     ])(
-      "%s accepts the video m-line",
-      async (_name, callerCodec, calleeCodec) => {
-        const answer = await negotiate(callerCodec, calleeCodec);
+      "%s accepts the video m-line and keeps the offer's spelling",
+      async (_name, callerCodec, calleeCodec, offerMime, rtpmapToken) => {
+        const { offer, answer } = await negotiate(callerCodec, calleeCodec);
         // Assert: m=video が拒否 (port 0) されず、codec が 1 つ選ばれる
         expect(answer.media[0].port).not.toBe(0);
         expect(answer.media[0].rtp.codecs.length).toBe(1);
         expect(answer.media[0].rtp.codecs[0].name.toLowerCase()).toMatch(
           /^av1/,
         );
+        // Assert: offer の mime 表記（AV1 / AV1X）が answer にそのまま保持される
+        expect(offer.media[0].rtp.codecs[0].mimeType).toBe(offerMime);
+        expect(answer.media[0].rtp.codecs[0].mimeType).toBe(offerMime);
+        // Assert: シリアライズされた SDP の a=rtpmap でも offer と同じ表記を保つ
+        expect(rtpmapNames(offer).join("|")).toContain(rtpmapToken);
+        expect(rtpmapNames(answer).join("|")).toContain(rtpmapToken);
+      },
+    );
+
+    it.each([
+      ["AV1 / AV1", useAV1(), useAV1(), "video/AV1", "AV1/"],
+      ["AV1X / AV1X", useAV1X(), useAV1X(), "video/AV1X", "AV1X/"],
+    ])(
+      "same-name %s negotiation preserves spelling end to end",
+      async (_name, callerCodec, calleeCodec, offerMime, rtpmapToken) => {
+        const { answer } = await negotiate(callerCodec, calleeCodec);
+        // Assert: 同一表記同士の交渉でも m-line を受け入れ、表記を保つ
+        expect(answer.media[0].port).not.toBe(0);
+        expect(answer.media[0].rtp.codecs[0].mimeType).toBe(offerMime);
+        expect(rtpmapNames(answer).join("|")).toContain(rtpmapToken);
       },
     );
   });

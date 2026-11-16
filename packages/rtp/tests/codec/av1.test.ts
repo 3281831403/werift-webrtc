@@ -12,6 +12,7 @@ import {
 } from "../../src";
 import { leb128encode } from "../../src/codec/leb128";
 import { loadPayloadVector } from "../utils";
+import { packetizeW0 } from "./av1W0Utils";
 
 describe("codec/av1 leb128", () => {
   test.each([
@@ -528,5 +529,187 @@ describe("codec/av1 Av1Packetizer layer boundaries", () => {
     expect(last.obu_or_fragment).toHaveLength(1);
     expect(last.obu_or_fragment[0].data.length).toBe(3);
     expect(packets.length).toBeGreaterThan(2);
+  });
+});
+
+// 上流パッカーが出力する W=0（全 element に leb128 長前置）パケットの受信・再構成。
+// チケット: W=0..3 と Z/Y 跨パケット分割を扱い、送信 OBU 列と逐字节一致で復元する。
+describe("codec/av1 W=0 upstream payloads", () => {
+  /** size field 付き OBU: F=0, type, X=0, S=1, R=0 + leb128(body) + body */
+  const makeObuWithSize = (typeId: number, body: Buffer): Buffer =>
+    Buffer.concat([
+      Buffer.from([((typeId & 0x0f) << 3) | 0x02]),
+      leb128encode(body.length),
+      body,
+    ]);
+
+  it("deSerialize は W=0 の全 element を長さ前置から読み取る", () => {
+    // Arrange: W=0、2 element（ともに長さ前置）
+    const obuA = Buffer.from([0x30, 0x01, 0x02]);
+    const obuB = Buffer.from([0x30, 0x03]);
+    const buf = Buffer.concat([
+      Buffer.from([0x00]),
+      leb128encode(obuA.length),
+      obuA,
+      leb128encode(obuB.length),
+      obuB,
+    ]);
+
+    // Act
+    const p = AV1RtpPayload.deSerialize(buf);
+
+    // Assert: W=0 のまま 2 element、どちらも完全 OBU（非断片）
+    expect(p.w_RtpNumObus).toBe(0);
+    expect(p.obu_or_fragment.map((o) => o.data)).toEqual([obuA, obuB]);
+    expect(
+      p.obu_or_fragment.every(
+        (o) => !o.isFragment && !o.continues && !o.isContinuation,
+      ),
+    ).toBe(true);
+  });
+
+  it("W=0 の単一 OBU が例外なく復元される（受信即ドロップの解消）", () => {
+    // Arrange: size field 付き OBU を W=0 の 1 パケットで
+    const obu = makeObuWithSize(6, Buffer.alloc(100, 0xab));
+    const packets = packetizeW0(obu, 1200);
+
+    // Act / Assert: deSerialize が例外を投げない
+    expect(() =>
+      packets.forEach((p) => AV1RtpPayload.deSerialize(p.payload)),
+    ).not.toThrow();
+
+    // Assert: 入力 OBU と逐字节一致
+    const frame = dePacketizeRtpPackets("AV1", packets);
+    expect(frame.data.equals(obu)).toBe(true);
+  });
+
+  it("W=0 の Z/Y 跨パケット分割が送信 OBU と逐字节一致する", () => {
+    // Arrange: MTU を超える単一 OBU
+    const big = makeObuWithSize(6, Buffer.alloc(1500, 0x5a));
+    const packets = packetizeW0(big, 300);
+    const payloads = packets.map((p) => AV1RtpPayload.deSerialize(p.payload));
+
+    // Assert: 先頭だけ Z=0、末尾だけ Y=0、中間は Z=Y=1、すべて W=0
+    expect(payloads.every((p) => p.w_RtpNumObus === 0)).toBe(true);
+    expect(payloads[0]!.zBit_RtpStartsWithFragment).toBe(0);
+    expect(
+      payloads.slice(1).every((p) => p.zBit_RtpStartsWithFragment === 1),
+    ).toBe(true);
+    expect(payloads.at(-1)!.yBit_RtpEndsWithFragment).toBe(0);
+    expect(
+      payloads.slice(0, -1).every((p) => p.yBit_RtpEndsWithFragment === 1),
+    ).toBe(true);
+
+    // Act
+    const frame = dePacketizeRtpPackets("AV1", packets);
+
+    // Assert: 再構成結果が元 OBU と逐字节一致
+    expect(frame.data.equals(big)).toBe(true);
+  });
+
+  it("W=0 で複数 OBU を含むキーフレームが逐字节一致で、余分な byte を付与しない", () => {
+    // Arrange: Sequence Header + 大きな Frame（キーフレーム）
+    const sequenceHeader = makeObuWithSize(1, Buffer.from([1, 2, 3]));
+    const frame = makeObuWithSize(6, Buffer.alloc(900, 0x77));
+    const sample = Buffer.concat([sequenceHeader, frame]);
+    const packets = packetizeW0(sample, 200, {
+      startsNewCodedVideoSequence: true,
+    });
+
+    // Act
+    expect(() =>
+      packets.forEach((p) => AV1RtpPayload.deSerialize(p.payload)),
+    ).not.toThrow();
+    const out = dePacketizeRtpPackets("AV1", packets);
+
+    // Assert: 長さも内容も入力 OBU 列と完全一致（余分な byte なし）、N でキーフレーム判定
+    expect(out.data.length).toBe(sample.length);
+    expect(out.data.equals(sample)).toBe(true);
+    expect(out.isKeyframe).toBe(true);
+  });
+
+  it("W=0 の同一パケット内で完全 OBU と断片が境界を保つ", () => {
+    // Arrange: 小さい完全 OBU と大きな OBU の先頭断片が同じパケットに入る
+    const sequenceHeader = makeObuWithSize(1, Buffer.from([1, 2, 3]));
+    const frame = makeObuWithSize(6, Buffer.alloc(500, 0x77));
+    const sample = Buffer.concat([sequenceHeader, frame]);
+    const packets = packetizeW0(sample, 220, {
+      startsNewCodedVideoSequence: true,
+    });
+    const first = AV1RtpPayload.deSerialize(packets[0]!.payload);
+
+    // Assert: 先頭パケットは完全 OBU と断片の 2 element。完全 OBU は断片扱いされない
+    expect(first.obu_or_fragment).toHaveLength(2);
+    expect(first.obu_or_fragment[0]!.isFragment).toBe(false);
+    expect(first.obu_or_fragment[0]!.continues).toBe(false);
+    expect(first.obu_or_fragment[1]!.isFragment).toBe(true);
+    expect(first.obu_or_fragment[1]!.continues).toBe(true);
+
+    // Act
+    const out = dePacketizeRtpPackets("AV1", packets);
+
+    // Assert: 2 OBU が別々に復元され、入力と逐字节一致
+    expect(out.data.equals(sample)).toBe(true);
+    expect(out.isKeyframe).toBe(true);
+  });
+
+  it("W=0 の長さ前置が壊れたパケットは明示的なエラーになる", () => {
+    // Arrange: 長さが実 body を超える不正 W=0 パケット
+    const malformed = Buffer.concat([
+      Buffer.from([0x00]), // W=0
+      Buffer.from([0x20]), // 32 byte と宣言
+      Buffer.from([0x30, 0x01]), // 実際は 2 byte しかない
+    ]);
+
+    // Act / Assert: RangeError ではなく専用メッセージで拒否
+    expect(() => AV1RtpPayload.deSerialize(malformed)).toThrow(
+      /OBU element length exceeds payload/,
+    );
+  });
+
+  it("W=1..3 パケットと W=0 パケットが同一フレーム内で混在しても復元できる", () => {
+    // Arrange: 自前パケットライザ（W=1..3）と W=0 の双方で同じ OBU 列を送信
+    const sequenceHeader = makeObuWithSize(1, Buffer.alloc(5, 0x01));
+    const frame = makeObuWithSize(6, Buffer.alloc(2000, 0x44));
+    const sample = Buffer.concat([sequenceHeader, frame]);
+    const nativePackets = new Av1Packetizer({
+      sequenceNumber: 1,
+      maxPayloadSize: 300,
+    }).packetize(sample, 90_000, {
+      frameType: "key",
+      startsNewCodedVideoSequence: true,
+    });
+    const w0Packets = packetizeW0(sample, 300, {
+      startsNewCodedVideoSequence: true,
+    });
+
+    // Act
+    const nativeOut = dePacketizeRtpPackets("AV1", nativePackets);
+    const w0Out = dePacketizeRtpPackets("AV1", w0Packets);
+
+    // Assert: パケット表現（W）は違えど、復元 OBU 列は同一（W=0 は元の size field を保持）
+    expect(
+      nativePackets.every(
+        (p) => AV1RtpPayload.deSerialize(p.payload).w_RtpNumObus !== 0,
+      ),
+    ).toBe(true);
+    expect(
+      w0Packets.every(
+        (p) => AV1RtpPayload.deSerialize(p.payload).w_RtpNumObus === 0,
+      ),
+    ).toBe(true);
+    // W=0 は元の OBU（size field 付き）を逐字节保持、ネイティブは §5 で size を除去。
+    // デコードされる OBU 本体（type / 拡張 / payload）が両者で一致することを検証する。
+    const toObuBodies = (frame: Buffer) =>
+      splitAv1Obus(frame).map((obu) => {
+        const parsed = AV1Obu.deSerialize(obu);
+        return {
+          type: parsed.obu_type,
+          extension: parsed.extension_header,
+          payload: Buffer.from(parsed.payload),
+        };
+      });
+    expect(toObuBodies(w0Out.data)).toEqual(toObuBodies(nativeOut.data));
+    expect(toObuBodies(nativeOut.data)).toEqual(toObuBodies(sample));
   });
 });

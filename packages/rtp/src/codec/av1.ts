@@ -113,9 +113,11 @@ export class AV1RtpPayload {
       throw new Error();
     }
 
+    // OBU element をパースする。W=0 は全 element に長さ前置、W=1..3 は
+    // 最後の element だけ長さ前置なし（残りバイト全体）。
+    const elements: Buffer[] = [];
     if (p.w_RtpNumObus === 0) {
       // W=0: every OBU element, including the last, is preceded by a length
-      let i = 0;
       while (offset < buf.length) {
         const [elementSize, bytes] = leb128decode(buf.subarray(offset));
         const start = offset + bytes;
@@ -123,54 +125,35 @@ export class AV1RtpPayload {
         if (end > buf.length) {
           throw new Error("AV1 OBU element length exceeds payload");
         }
-        const isFirst = i === 0;
-        const isLast = end >= buf.length;
-        const isFragment =
-          (isFirst && !!p.zBit_RtpStartsWithFragment) ||
-          (isLast && !!p.yBit_RtpEndsWithFragment);
-        p.obu_or_fragment.push({
-          data: buf.subarray(start, end),
-          isFragment,
-          continues: isLast && !!p.yBit_RtpEndsWithFragment,
-          isContinuation: isFirst && !!p.zBit_RtpStartsWithFragment,
-        });
+        elements.push(buf.subarray(start, end));
         offset = end;
-        i++;
       }
-      return p;
+    } else {
+      // W=1..3: 最後以外は長さ前置、最後は残りのバイト全体
+      for (let i = 0; i < p.w_RtpNumObus - 1; i++) {
+        const [elementSize, bytes] = leb128decode(buf.subarray(offset));
+        const start = offset + bytes;
+        const end = start + elementSize;
+        if (end > buf.length) {
+          throw new Error("AV1 OBU element length exceeds payload");
+        }
+        elements.push(buf.subarray(start, end));
+        offset = end;
+      }
+      elements.push(buf.subarray(offset));
     }
 
-    [...Array(p.w_RtpNumObus - 1).keys()].forEach((i) => {
-      const [elementSize, bytes] = leb128decode(buf.subarray(offset));
-
-      const start = offset + bytes;
-      const end = start + elementSize;
-
-      let isFragment = false;
-      if (p.zBit_RtpStartsWithFragment && i === 0) {
-        isFragment = true;
-      }
-      p.obu_or_fragment.push({
-        data: buf.subarray(start, end),
-        isFragment,
-        continues: false,
-        isContinuation: isFragment,
-      });
-
-      offset += bytes + elementSize;
-    });
-    let isFragment = false;
-    if (
-      p.yBit_RtpEndsWithFragment ||
-      (p.w_RtpNumObus === 1 && p.zBit_RtpStartsWithFragment)
-    ) {
-      isFragment = true;
-    }
-    p.obu_or_fragment.push({
-      data: buf.subarray(offset),
-      isFragment: isFragment,
-      continues: !!p.yBit_RtpEndsWithFragment,
-      isContinuation: !!p.zBit_RtpStartsWithFragment && p.w_RtpNumObus === 1,
+    // Z は先頭 element だけ、Y は末尾 element だけを断片として示す
+    // （AV1 RTP §4.4）。中間 element は常に完全な OBU。W の値によらず
+    // element 境界は長さフィールドから一意に決まるため、位置推測には頼らない。
+    const lastIndex = elements.length - 1;
+    p.obu_or_fragment = elements.map((data, i) => {
+      const isFirst = i === 0;
+      const isLast = i === lastIndex;
+      const isContinuation = isFirst && !!p.zBit_RtpStartsWithFragment;
+      const continues = isLast && !!p.yBit_RtpEndsWithFragment;
+      const isFragment = isContinuation || continues;
+      return { data, isFragment, continues, isContinuation };
     });
 
     return p;
